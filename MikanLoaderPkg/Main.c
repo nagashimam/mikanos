@@ -7,7 +7,7 @@
 #include <Protocol/DiskIo2.h>
 #include <Protocol/BlockIo.h>
 #include <Guid/FileInfo.h>
-
+#include "./Main.h"
 struct MemoryMap
 {
     UINTN buffer_size;
@@ -75,26 +75,39 @@ const CHAR16 *GetMemoryTypeUnicode(EFI_MEMORY_TYPE type)
 
 EFI_STATUS SaveMemoryMap(struct MemoryMap *map, EFI_FILE_PROTOCOL *file)
 {
-    CHAR8 buf[256];
-    UINTN len;
-
-    CHAR8 *header =
-        "Index, Type, Type(name), PhysicalStart, NumberOfPages, Attribute\n";
-    len = AsciiStrLen(header);
-    file->Write(file, &len, header);
-
+    SaveMemoryMapHeader(file);
     Print(L"map->buffer = %08lx, map->map_size = %08lx\n", map->buffer, map->map_size);
 
-    EFI_PHYSICAL_ADDRESS iter;
-    int i;
-    for (iter = (EFI_PHYSICAL_ADDRESS)map->buffer, i = 0; iter < (EFI_PHYSICAL_ADDRESS)map->buffer + map->map_size; iter += map->descriptor_size, i++)
-    {
-        EFI_MEMORY_DESCRIPTOR *desc = (EFI_MEMORY_DESCRIPTOR *)iter;
-        len = AsciiSPrint(buf, sizeof(buf), "%u, %x, %-ls, %08lx, %lx, %ls\n", i, desc->Type, GetMemoryTypeUnicode(desc->Type), desc->PhysicalStart, desc->NumberOfPages, desc->Attribute & 0xffffflu);
-        file->Write(file, &len, buf);
-    }
+    int startLine = 0;
+    EFI_PHYSICAL_ADDRESS startAddress = (EFI_PHYSICAL_ADDRESS)map->buffer;
+    SaveMemoryMapBody(map, file, startLine, startAddress);
 
     return EFI_SUCCESS;
+}
+
+void SaveMemoryMapHeader(EFI_FILE_PROTOCOL *file)
+{
+    CHAR8 *header =
+        "Index, Type, Type(name), PhysicalStart, NumberOfPages, Attribute\n";
+    UINTN headerLen = AsciiStrLen(header);
+    file->Write(file, &headerLen, header);
+}
+
+void SaveMemoryMapBody(struct MemoryMap *map, EFI_FILE_PROTOCOL *file, int lineCount, EFI_PHYSICAL_ADDRESS descriptorAddress)
+{
+    if (descriptorAddress >= (EFI_PHYSICAL_ADDRESS)map->buffer + map->map_size)
+    {
+        return;
+    }
+
+    CHAR8 buffer[256];
+    EFI_MEMORY_DESCRIPTOR *descriptor = (EFI_MEMORY_DESCRIPTOR *)descriptorAddress;
+    UINTN memoryMapInfo = AsciiSPrint(buffer, sizeof(buffer), "%u, %x, %-ls, %08lx, %lx, %ls\n", lineCount, descriptor->Type, GetMemoryTypeUnicode(descriptor->Type), descriptor->PhysicalStart, descriptor->NumberOfPages, descriptor->Attribute & 0xffffflu);
+    file->Write(file, &memoryMapInfo, buffer);
+
+    EFI_PHYSICAL_ADDRESS newDescriptorAddress = descriptorAddress + map->descriptor_size;
+    int newLineCount = lineCount + 1;
+    SaveMemoryMapBody(map, file, newLineCount, newDescriptorAddress);
 }
 
 EFI_STATUS OpenRootDir(EFI_HANDLE image_handle, EFI_FILE_PROTOCOL **root)
@@ -122,52 +135,29 @@ EFI_STATUS OpenRootDir(EFI_HANDLE image_handle, EFI_FILE_PROTOCOL **root)
     return EFI_SUCCESS;
 }
 
-EFI_STATUS EFIAPI UefiMain(
-    EFI_HANDLE image_handle,
-    EFI_SYSTEM_TABLE *system_table)
+void GetAndSaveMemoryMap(EFI_HANDLE image_handle, EFI_FILE_PROTOCOL *root_dir, struct MemoryMap *memmap)
 {
-    Print(L"Hello, Mikan World!\n");
-
-    CHAR8 memmap_buf[4096 * 4];
-    struct MemoryMap memmap = {sizeof(memmap_buf), memmap_buf, 0, 0, 0, 0};
-    GetMemoryMap(&memmap);
-
-    EFI_FILE_PROTOCOL *root_dir;
-    OpenRootDir(image_handle, &root_dir);
-
     EFI_FILE_PROTOCOL *memmap_file;
     root_dir->Open(root_dir, &memmap_file, L"\\memmap", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
 
-    SaveMemoryMap(&memmap, memmap_file);
+    GetMemoryMap(memmap);
+    SaveMemoryMap(memmap, memmap_file);
     memmap_file->Close(memmap_file);
+}
 
-    EFI_FILE_PROTOCOL *kernel_file;
-    root_dir->Open(root_dir, &kernel_file, L"\\kernel.elf", EFI_FILE_MODE_READ, 0);
-
-    UINTN file_info_size = sizeof(EFI_FILE_INFO) + sizeof(CHAR16) * 12;
-    UINT8 file_info_buffer[file_info_size];
-    kernel_file->GetInfo(kernel_file, &gEfiFileInfoGuid, &file_info_size, file_info_buffer);
-
-    EFI_FILE_INFO *file_info = (EFI_FILE_INFO *)file_info_buffer;
-    UINTN kernel_file_size = file_info->FileSize;
-
-    EFI_PHYSICAL_ADDRESS kernel_base_addr = 0x100000;
-    gBS->AllocatePages(AllocateAddress, EfiLoaderData, (kernel_file_size + 0xfff) / 0x1000, &kernel_base_addr);
-    kernel_file->Read(kernel_file, &kernel_file_size, (VOID *)kernel_base_addr);
-    Print(L"Kernel: 0x&0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
-
-    EFI_STATUS status;
-    status = gBS->ExitBootServices(image_handle, memmap.map_key);
+void ExitBootServices(EFI_HANDLE image_handle, struct MemoryMap *memmap)
+{
+    EFI_STATUS status = gBS->ExitBootServices(image_handle, memmap->map_key);
     if (EFI_ERROR(status))
     {
-        status = GetMemoryMap(&memmap);
+        status = GetMemoryMap(memmap);
         if (EFI_ERROR(status))
         {
             Print(L"failed to get memory map: %r\n", status);
             while (1)
                 ;
         }
-        status = gBS->ExitBootServices(image_handle, memmap.map_key);
+        status = gBS->ExitBootServices(image_handle, memmap->map_key);
         if (EFI_ERROR(status))
         {
             Print(L"Could not exit boot service: %r\n", status);
@@ -175,12 +165,53 @@ EFI_STATUS EFIAPI UefiMain(
                 ;
         }
     }
+}
 
+UINTN GetKernelFileSize(EFI_FILE_PROTOCOL *root_dir, EFI_FILE_PROTOCOL **kernel_file)
+{
+    root_dir->Open(root_dir, kernel_file, L"\\kernel.elf", EFI_FILE_MODE_READ, 0);
+    UINTN file_info_size = sizeof(EFI_FILE_INFO) + sizeof(CHAR16) * 12;
+    UINT8 file_info_buffer[file_info_size];
+    (*kernel_file)->GetInfo(*kernel_file, &gEfiFileInfoGuid, &file_info_size, file_info_buffer);
+
+    EFI_FILE_INFO *file_info = (EFI_FILE_INFO *)file_info_buffer;
+    return file_info->FileSize;
+}
+void LoadKernel(EFI_FILE_PROTOCOL *kernel_file, UINTN kernel_file_size, EFI_PHYSICAL_ADDRESS kernel_base_addr)
+{
+    gBS->AllocatePages(AllocateAddress, EfiLoaderData, (kernel_file_size + 0xfff) / 0x1000, &kernel_base_addr);
+    kernel_file->Read(kernel_file, &kernel_file_size, (VOID *)kernel_base_addr);
+    Print(L"Kernel: 0x&0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
+}
+
+void StartKernel(EFI_PHYSICAL_ADDRESS kernel_base_addr)
+{
     UINT64 entry_addr = *(UINT64 *)(kernel_base_addr + 24);
-
     typedef void EntryPointType(void);
     EntryPointType *entry_point = (EntryPointType *)entry_addr;
     entry_point();
+}
+
+EFI_STATUS EFIAPI UefiMain(
+    EFI_HANDLE image_handle,
+    EFI_SYSTEM_TABLE *system_table)
+{
+    Print(L"Hello, Mikan World!\n");
+
+    EFI_FILE_PROTOCOL *root_dir;
+    OpenRootDir(image_handle, &root_dir);
+
+    CHAR8 memmap_buf[4096 * 4];
+    struct MemoryMap memmap = {sizeof(memmap_buf), memmap_buf, 0, 0, 0, 0};
+    GetAndSaveMemoryMap(image_handle, root_dir, &memmap);
+
+    EFI_FILE_PROTOCOL *kernel_file;
+    UINTN kernel_file_size = GetKernelFileSize(root_dir, &kernel_file);
+    EFI_PHYSICAL_ADDRESS kernel_base_addr = 0x100000;
+
+    LoadKernel(kernel_file, kernel_file_size, kernel_base_addr);
+    ExitBootServices(image_handle, &memmap);
+    StartKernel(kernel_base_addr);
 
     Print(L"All done\n");
 
