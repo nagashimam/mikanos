@@ -185,12 +185,12 @@ void LoadKernel(EFI_FILE_PROTOCOL *kernel_file, UINTN kernel_file_size, EFI_PHYS
     Print(L"Kernel: 0x&0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
 }
 
-void StartKernel(EFI_PHYSICAL_ADDRESS kernel_base_addr)
+void StartKernel(EFI_PHYSICAL_ADDRESS kernel_base_addr, UINT64 frameBufferBase, UINT64 frameBufferSize)
 {
     UINT64 entry_addr = *(UINT64 *)(kernel_base_addr + 24);
-    typedef void EntryPointType(void);
+    typedef void EntryPointType(UINT64, UINT64);
     EntryPointType *entry_point = (EntryPointType *)entry_addr;
-    entry_point();
+    entry_point(frameBufferBase, frameBufferSize);
 }
 
 EFI_STATUS OpenGOP(EFI_HANDLE image_handle, EFI_GRAPHICS_OUTPUT_PROTOCOL **gop)
@@ -266,7 +266,7 @@ EFI_STATUS EFIAPI UefiMain(
 
     LoadKernel(kernel_file, kernel_file_size, kernel_base_addr);
     ExitBootServices(image_handle, &memmap);
-    StartKernel(kernel_base_addr);
+    StartKernel(kernel_base_addr, gop->Mode->FrameBufferBase, gop->Mode->FrameBufferSize);
 
     Print(L"All done\n");
 
